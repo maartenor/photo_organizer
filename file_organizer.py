@@ -122,28 +122,79 @@ def get_image_date_taken(file_path):
     return None
 
 def get_video_date_created(file_path):
-    """Extract the 'Media Created' date from video metadata."""
+    """Extract the 'Media Created' date from video metadata with expanded support."""
     try:
+        # First try with hachoir
         parser = createParser(file_path)
-        if not parser:
-            return None
-            
-        metadata = extractMetadata(parser)
-        if not metadata:
-            parser.close()
-            return None
-            
-        for key in ['creation_date', 'datetime_original']:
-            if hasattr(metadata, key):
-                date = getattr(metadata, key).value
-                year = date.year
-                month = f"{date.month:02d}"
+        if parser:
+            metadata = extractMetadata(parser)
+            if metadata:
+                # Try different metadata fields that might contain creation date
+                for key in ['creation_date', 'datetime_original', 'creation_datetime']:
+                    if hasattr(metadata, key):
+                        date = getattr(metadata, key).value
+                        year = date.year
+                        month = f"{date.month:02d}"
+                        parser.close()
+                        return (str(year), month)
                 parser.close()
-                return (str(year), month)
+        
+        # If hachoir fails, try with ffmpeg/ffprobe if available
+        try:
+            import subprocess
+            cmd = [
+                'ffprobe', 
+                '-v', 'quiet', 
+                '-print_format', 'json', 
+                '-show_format', 
+                '-show_streams', 
+                file_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                import json
+                data = json.loads(result.stdout)
                 
-        parser.close()
+                # Try to find date in tags
+                for section in ['format', 'streams']:
+                    if section in data:
+                        if isinstance(data[section], list):
+                            items = data[section]
+                        else:
+                            items = [data[section]]
+                            
+                        for item in items:
+                            if 'tags' in item:
+                                tags = item['tags']
+                                for date_tag in ['creation_time', 'date', 'DateTimeOriginal']:
+                                    if date_tag in tags:
+                                        date_str = tags[date_tag]
+                                        # Try to parse date string in various formats
+                                        for fmt in [
+                                            '%Y-%m-%dT%H:%M:%S.%fZ',  # ISO format
+                                            '%Y-%m-%d %H:%M:%S',      # Standard format
+                                            '%Y:%m:%d %H:%M:%S',      # EXIF format
+                                        ]:
+                                            try:
+                                                date = datetime.datetime.strptime(date_str, fmt)
+                                                return (str(date.year), f"{date.month:02d}")
+                                            except ValueError:
+                                                continue
+        except (ImportError, FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+            logger.debug(f"FFprobe extraction failed: {e}")
+            
+        # Fall back to file stats as last resort
+        if os.path.exists(file_path):
+            stat = os.stat(file_path)
+            # Try creation time first, then modification time
+            for timestamp in [stat.st_ctime, stat.st_mtime]:
+                date = datetime.datetime.fromtimestamp(timestamp)
+                # Only use file stats if they seem reasonable (not default/epoch dates)
+                if date.year > 1980:  # Arbitrary cutoff for reasonable file dates
+                    return (str(date.year), f"{date.month:02d}")
+                    
     except Exception as e:
-        return None
+        logger.debug(f"Error extracting video date: {e}")
         
     return None
 
