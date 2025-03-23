@@ -1,0 +1,5 @@
+.venv/
+setup_venv.bat
+setup_venv.py
+setup_venv.sh
+database/file_organizer.db
