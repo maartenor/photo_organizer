@@ -1,4 +1,2 @@
 pillow>=9.0.0
 hachoir>=3.1.2
-yaml
-kubernetes
