@@ -1,5 +1,6 @@
 import os
 import sys
+import platform
 import shutil
 import sqlite3
 import datetime
@@ -229,6 +230,12 @@ def extract_timestamp_from_filename(filename):
             
     return None
 
+def is_network_path(path):
+    """Check if a path is a network path (UNC path on Windows)."""
+    if platform.system() == "Windows":
+        return path.startswith('\\\\')
+    return False
+
 def is_image_file(file_path):
     """Check if the file is an image based on its mimetype."""
     mime = mimetypes.guess_type(file_path)[0]
@@ -340,9 +347,21 @@ def main():
     parser.add_argument('--target', '-t', required=True, help='Target directory for organized files')
     args = parser.parse_args()
     
-    source_dir = os.path.abspath(args.source)
-    target_dir = os.path.abspath(args.target)
+    source_dir = os.path.normpath(args.source)
+    target_dir = os.path.normpath(args.target)
     
+    # Check if (network) source_dir exists
+    if not os.path.exists(source_dir):
+        logger.error(f"Source directory does not exist or is not accessible: {source_dir}")
+        sys.exit(1)
+        
+    # Check (network) target path is writable by attempting to create it
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Cannot access or create target directory: {target_dir}. Error: {e}")
+        sys.exit(1)
+
     # Create necessary folders
     script_dir = os.path.dirname(os.path.abspath(__file__))
     db_dir = os.path.join(script_dir, 'database')
