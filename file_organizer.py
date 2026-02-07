@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import datetime
 import argparse
+import hashlib
 from PIL import Image
 from PIL.ExifTags import TAGS
 import logging
@@ -35,6 +36,7 @@ class WarningCodes:
     NO_DATE_METADATA = 10
     UNSUPPORTED_FILE = 20
     FILENAME_DATE_EXTRACTION = 30
+    DUPLICATE_FILE = 40
 
 def setup_database(db_path):
     """Set up the SQLite database for logging file operations."""
@@ -101,25 +103,77 @@ def log_issue(conn, filename, warning_code=None, error_code=None, description=No
         logger.error(f"Database error while logging issue: {e}")
 
 def get_image_date_taken(file_path):
-    """Extract the 'Date Taken' from image metadata."""
+    """
+    Extract the date from image using multiple fallback methods:
+    1. EXIF 'DateTimeOriginal' (Date Taken)
+    2. Earliest of file 'Date Created' and 'Date Modified'
+    3. Parse date from filename
+    """
+    # Step 1: Try EXIF DateTimeOriginal
     try:
         with Image.open(file_path) as img:
             exif_data = img._getexif()
-            if not exif_data:
-                return None
-                
-            for tag_id, value in exif_data.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == 'DateTimeOriginal':
-                    # Format: 'YYYY:MM:DD HH:MM:SS'
-                    date_pattern = r'(\d{4}):(\d{2}):\d{2}'
-                    match = re.search(date_pattern, value)
-                    if match:
-                        year, month = match.groups()
-                        return (year, month)
+            if exif_data:
+                for tag_id, value in exif_data.items():
+                    tag = TAGS.get(tag_id, tag_id)
+                    if tag == 'DateTimeOriginal':
+                        # Format: 'YYYY:MM:DD HH:MM:SS'
+                        date_pattern = r'(\d{4}):(\d{2}):\d{2}'
+                        match = re.search(date_pattern, value)
+                        if match:
+                            year, month = match.groups()
+                            if int(year) > 1980:
+                                return (year, month)
     except Exception as e:
-        return None
-    
+        logger.debug(f"EXIF extraction failed for {file_path}: {e}")
+
+    # Step 2: Use earliest of Date Created and Date Modified
+    # (Copying may set creation date to today, or touching may update modified date)
+    try:
+        if os.path.exists(file_path):
+            stat = os.stat(file_path)
+            # Get both creation and modification times
+            ctime = stat.st_ctime  # Creation time (Windows) or metadata change (Unix)
+            mtime = stat.st_mtime  # Modification time
+
+            # Use the earliest timestamp
+            earliest_timestamp = min(ctime, mtime)
+            date = datetime.datetime.fromtimestamp(earliest_timestamp)
+
+            # Only use if the year is reasonable (> 1980)
+            if date.year > 1980:
+                return (str(date.year), f"{date.month:02d}")
+    except Exception as e:
+        logger.debug(f"File stat extraction failed for {file_path}: {e}")
+
+    # Step 3: Try to extract date from filename
+    filename = os.path.basename(file_path)
+    patterns = [
+        r'(\d{4})[-_](\d{2})[-_]\d{2}',  # YYYY-MM-DD or YYYY_MM_DD
+        r'\d{2}[-_](\d{2})[-_](\d{4})',  # DD-MM-YYYY or DD_MM_YYYY
+        r'(\d{4})(\d{2})\d{2}',          # YYYYMMDD
+        r'IMG[-_](\d{4})(\d{2})\d{2}',   # IMG-YYYYMMDD or IMG_YYYYMMDD
+        r'VID[-_](\d{4})(\d{2})\d{2}'    # VID-YYYYMMDD or VID_YYYYMMDD
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, filename)
+        if match:
+            year, month = match.groups()
+            year = int(year)
+            month = int(month)
+
+            # Validate month (must be 01-12)
+            if month < 1 or month > 12:
+                continue
+
+            # Validate year (> 1980 and not in the future)
+            current_year = datetime.datetime.now().year
+            current_month = datetime.datetime.now().month
+
+            if year > 1980 and ((year < current_year) or (year == current_year and month <= current_month)):
+                return (str(year), f"{month:02d}")
+
     return None
 
 def get_video_date_created(file_path):
@@ -217,17 +271,20 @@ def extract_timestamp_from_filename(filename):
         match = re.search(pattern, filename)
         if match:
             year, month = match.groups()
-            
-            # Validate year (must be in the past)
-            current_year = datetime.datetime.now().year
-            current_month = datetime.datetime.now().month
             year = int(year)
             month = int(month)
-            
-            if (year < current_year) or (year == current_year and month <= current_month):
-                # Ensure month is formatted as two digits
+
+            # Validate month (must be 01-12)
+            if month < 1 or month > 12:
+                continue
+
+            # Validate year (> 1980 and not in the future)
+            current_year = datetime.datetime.now().year
+            current_month = datetime.datetime.now().month
+
+            if year > 1980 and ((year < current_year) or (year == current_year and month <= current_month)):
                 return (str(year), f"{month:02d}")
-            
+
     return None
 
 def is_network_path(path):
@@ -246,6 +303,64 @@ def is_video_file(file_path):
     mime = mimetypes.guess_type(file_path)[0]
     return mime and mime.startswith('video/')
 
+def get_file_hash(file_path, chunk_size=8192):
+    """Calculate MD5 hash of a file."""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def safe_move_file(source_path, target_path, unprocessable_folder, conn):
+    """
+    Safely move a file, handling duplicates.
+    If target exists and content is identical, move source to unprocessable as .dup
+    Returns the actual path where the file was moved.
+    """
+    file_name = os.path.basename(source_path)
+
+    if os.path.exists(target_path):
+        # Target file already exists - check if it's a duplicate
+        try:
+            source_hash = get_file_hash(source_path)
+            target_hash = get_file_hash(target_path)
+
+            if source_hash == target_hash:
+                # Files are identical - move source to unprocessable as .dup
+                base_name, ext = os.path.splitext(file_name)
+                dup_name = f"{base_name}{ext}.dup"
+                dup_path = os.path.join(unprocessable_folder, dup_name)
+
+                # Handle case where .dup file also exists
+                counter = 1
+                while os.path.exists(dup_path):
+                    dup_name = f"{base_name}{ext}.dup{counter}"
+                    dup_path = os.path.join(unprocessable_folder, dup_name)
+                    counter += 1
+
+                shutil.move(source_path, dup_path)
+                log_issue(conn, file_name, WarningCodes.DUPLICATE_FILE, None,
+                          f"Duplicate file detected (identical to {target_path}), moved to {dup_path}")
+                return dup_path
+            else:
+                # Files have same name but different content - rename with suffix
+                base_name, ext = os.path.splitext(file_name)
+                counter = 1
+                new_target_path = target_path
+                while os.path.exists(new_target_path):
+                    new_name = f"{base_name}_{counter}{ext}"
+                    new_target_path = os.path.join(os.path.dirname(target_path), new_name)
+                    counter += 1
+                shutil.move(source_path, new_target_path)
+                return new_target_path
+        except Exception as e:
+            logger.debug(f"Error comparing files: {e}")
+            raise
+    else:
+        # Target doesn't exist - normal move
+        shutil.move(source_path, target_path)
+        return target_path
+
 def process_file(file_path, target_root, to_sort_folder, unprocessable_folder, conn):
     """Process a single file and move it to the appropriate location."""
     file_name = os.path.basename(file_path)
@@ -260,82 +375,82 @@ def process_file(file_path, target_root, to_sort_folder, unprocessable_folder, c
         else:
             # Not an image or video file
             target_path = os.path.join(unprocessable_folder, file_name)
-            shutil.move(file_path, target_path)
-            log_process(conn, file_name, target_path)
-            log_issue(conn, file_name, WarningCodes.UNSUPPORTED_FILE, None, 
+            actual_path = safe_move_file(file_path, target_path, unprocessable_folder, conn)
+            log_process(conn, file_name, actual_path)
+            log_issue(conn, file_name, WarningCodes.UNSUPPORTED_FILE, None,
                       f"File is neither image nor video: {file_name}")
             return
         
         if date_info:
             year, month = date_info
             year_month_folder = os.path.join(target_root, year, month)
-            
+
             # Create year/month folder if it doesn't exist
             if not os.path.exists(year_month_folder):
                 os.makedirs(year_month_folder)
-                
+
             target_path = os.path.join(year_month_folder, file_name)
         else:
             # No date metadata found
             target_path = os.path.join(to_sort_folder, file_name)
-            log_issue(conn, file_name, WarningCodes.NO_DATE_METADATA, None, 
+            log_issue(conn, file_name, WarningCodes.NO_DATE_METADATA, None,
                       f"No date metadata found for {file_type} file: {file_name}")
-        
-        # Move the file
-        shutil.move(file_path, target_path)
-        log_process(conn, file_name, target_path)
+
+        # Move the file (handles duplicates)
+        actual_path = safe_move_file(file_path, target_path, unprocessable_folder, conn)
+        log_process(conn, file_name, actual_path)
         
     except Exception as e:
         # Handle any other errors
         try:
-            # Try to move to unprocessable folder
+            # Try to move to unprocessable folder (handle duplicates)
             target_path = os.path.join(unprocessable_folder, file_name)
-            shutil.move(file_path, target_path)
-            log_process(conn, file_name, target_path)
+            actual_path = safe_move_file(file_path, target_path, unprocessable_folder, conn)
+            log_process(conn, file_name, actual_path)
         except Exception as move_error:
-            log_issue(conn, file_name, None, ErrorCodes.MOVE_ERROR, 
+            log_issue(conn, file_name, None, ErrorCodes.MOVE_ERROR,
                       f"Failed to move file to unprocessable folder: {move_error}")
-        
-        log_issue(conn, file_name, None, ErrorCodes.UNPROCESSABLE_FILE, 
+
+        log_issue(conn, file_name, None, ErrorCodes.UNPROCESSABLE_FILE,
                   f"Error processing file: {e}")
 
-def process_unsorted_files(to_sort_folder, target_root, conn):
+def process_unsorted_files(to_sort_folder, target_root, unprocessable_folder, conn):
     """Process files in the 'to_sort' folder by extracting dates from filenames."""
     if not os.path.exists(to_sort_folder):
         logger.warning(f"'to_sort' folder does not exist: {to_sort_folder}")
         return
-        
+
     for filename in os.listdir(to_sort_folder):
         file_path = os.path.join(to_sort_folder, filename)
         if not os.path.isfile(file_path):
             continue
-            
+
         date_info = extract_timestamp_from_filename(filename)
-        
+
         if date_info:
             year, month = date_info
             year_month_folder = os.path.join(target_root, year, month)
-            
+
             # Create year/month folder if it doesn't exist
             if not os.path.exists(year_month_folder):
                 os.makedirs(year_month_folder)
-                
+
             target_path = os.path.join(year_month_folder, filename)
-            
+
             try:
-                # Move the file
-                shutil.move(file_path, target_path)
-                
+                # Move the file (handles duplicates)
+                actual_path = safe_move_file(file_path, target_path, unprocessable_folder, conn)
+
                 # Log the process
-                log_process(conn, filename, target_path)
-                
+                log_process(conn, filename, actual_path)
+
                 # Add warning about extracted timestamp
-                log_issue(conn, filename, WarningCodes.NO_DATE_METADATA, None, 
+                log_issue(conn, filename, WarningCodes.NO_DATE_METADATA, None,
                          f"Moved based on filename timestamp: {year}-{month}")
-                
-                logger.info(f"Moved '{filename}' to {year_month_folder} based on filename timestamp")
+
+                logger.info(f"Moved '{filename}' to {actual_path} based on filename timestamp")
             except Exception as e:
-                log_issue(conn, filename, None, ErrorCodes.MOVE_ERROR, 
+                log_issue(conn, filename, None, ErrorCodes.MOVE_ERROR,
                          f"Failed to move file from to_sort folder: {e}")
         else:
             # Keep in to_sort folder if no date could be extracted
@@ -373,7 +488,7 @@ def main():
             os.makedirs(folder)
     
     # Set up database
-    db_path = os.path.join(db_dir, 'file_organizer.db')
+    db_path = os.path.join(db_dir, 'file_organizer_fred.db')
     conn = setup_database(db_path)
     
     # Initialize mime types
@@ -392,7 +507,7 @@ def main():
     try:
         # Add this before conn.close() in the main function
         logger.info("Processing files in 'to_sort' folder...")
-        process_unsorted_files(to_sort_folder, target_dir, conn)
+        process_unsorted_files(to_sort_folder, target_dir, unprocessable_folder, conn)
         logger.info("Processing files in 'to_sort' folder completed successfully.")
     except Exception as e:
         logger.error(f"Error processing files in 'to_sort' folder: {e}")
