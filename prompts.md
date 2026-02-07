@@ -14,11 +14,17 @@ for video files, using the 'Media Created' attribute
 
 do same as image
 
+Step 1 (EXIF): Data taken. 
+If this fails - no EXIF data
+Step 2 (File stats): Uses min(File.Data_Creation, File.Date_Modified) = 2016-04-21 → Returns ("2016", "04")
+If even that fails
+Step 3 (file name)
+
 else if no date attribute value exists in that file, save to separate folder 'to sort folder' and do the same.
 
 for files in 'to sort folder', use the filename and try to use that to create a timestamp 
 
-where timestamp can only be the past
+where timestamp can only be the past but not be earlier than year 1980
 
 move that file based on filename extracted timestamp to correct year-month folder
 
@@ -42,5 +48,26 @@ where warning_code and issue_description are filled on when warnings are raised 
 
 and error_code and issue_description for rasied errors
 
+add duplicate handling to the code
+
 create the requirements.txt for this
 
+
+
+Create kubernetes setup yaml files and additional py script files, 
+
+so a user can upload image and video files that need sorting to a local network folder
+
+and select the 'network storage target folder' under '\\192.168.1.2\pictures\' (default) for example '\\192.168.1.2\pictures\myself' or '\\192.168.1.2\pictures\otherfolks'
+
+The 'network storage target folder' values should be defined in a separate yaml file, and check on valid (network) paths requirements by a script. 
+
+the 'network storage target folder' and uploading of files should be able to be done by user from a smartphone or tablet
+
+Once a user uploads new files in that folder, it should trigger a kubernetes worker pod to be started
+
+which performs the file organizing py script above
+
+This setup should not be able to remove files nor delete/destroy the network storage target files nor directories
+
+ensure the file_organizer.db process database and stdout are stored in a persistent volume
